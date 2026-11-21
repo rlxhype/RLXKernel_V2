@@ -1,0 +1,169 @@
+name: Build RLXKernel_V2-cip100 (KernelSU)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [a10, a20, a20e, a30, a30s, a40]
+
+    steps:
+      - name: Checkout upstream EurekaV2 source
+        uses: actions/checkout@v4
+        with:
+          repository: Shaheddan/android_kernel_samsung_exynos7885
+          ref: EurekaV2
+          submodules: recursive
+          path: kernel
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flex bison bc libssl-dev libelf-dev zlib1g-dev zstd
+          pip3 install git+https://github.com/Roynas-Android-Playground/kernelbuild_common.git
+
+      - name: Download Neutron Clang 18
+        working-directory: kernel
+        run: |
+          curl -L --retry 3 -o /tmp/clang.tar.zst \
+            https://github.com/Neutron-Toolchains/clang-build-catalogue/releases/download/05012024/neutron-clang-05012024.tar.zst
+          mkdir -p toolchain
+          tar --use-compress-program=unzstd -xf /tmp/clang.tar.zst -C toolchain
+          toolchain/bin/clang --version
+
+      - name: Apply RLXKernel branding + enable KernelSU
+        working-directory: kernel
+        run: |
+          printf '%s\n' '-RLXKernel_V2' > localversion
+          printf '%s\n' '-cip100' > localversion-cip
+          sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
+          # KernelSU requires KPROBES; upstream defconfig has KSU core wired already
+          grep -q '^CONFIG_KPROBES=y' arch/arm64/configs/exynos7885_defconfig || \
+            printf '\nCONFIG_KPROBES=y\n' >> arch/arm64/configs/exynos7885_defconfig
+          cat > build_kernel.py <<'PYEOF'
+          from kernelbuild_common import KernelBuild, logging
+          from kernelbuild_common.compiler import CompilerClang
+          from argparse import ArgumentParser
+          from pathlib import Path
+          import os
+
+
+          class EurekaKernelBuild(KernelBuild):
+              def __init__(self):
+                  super().__init__(
+                      "RLXKernel_V2-cip100",
+                      arch="arm64",
+                      kernelType="Image",
+                      anykernelDir=Path("AnyKernel3"),
+                  )
+
+              def initArgParser(self) -> ArgumentParser:
+                  parser = super().initArgParser()
+                  parser.add_argument(
+                      "--target", type=str, required=True, help="Target device (a10/a20/...)"
+                  )
+                  parser.add_argument(
+                      "--no-ksu",
+                      action="store_true",
+                      help="Don't include KernelSU support in kernel",
+                  )
+                  return parser
+
+              def verifyArgs(self):
+                  supplist = ["a10", "a20", "a20e", "a30", "a30s", "a40", "m20", "jackpotlte"]
+                  if not self.args.target in supplist:
+                      logging.error(
+                          f"Invalid target '{self.args.target}'. Supported: {', '.join(supplist)}"
+                      )
+                      return False
+                  return True
+
+              def buildDefconfigList(self) -> "list[str]":
+                  args = self.args
+                  defconfigs = ["exynos7885_defconfig", f"{args.target}.config"]
+                  if args.no_ksu:
+                      defconfigs.append("noksu.config")
+                  return defconfigs
+
+              def additionalMakeArgs(self) -> "list[str]":
+                  # Parallel jobs configurable (last -j wins). Default 2 for low-RAM hosts.
+                  jobs = os.environ.get("BUILD_JOBS", "2")
+                  return CompilerClang.ADDITIONALARGS_LLVM_FULL + [f"-j{jobs}"]
+
+              def preBuildInfo(self) -> "dict[str, str]":
+                  args = self.args
+                  return {
+                      "KERNEL_NAME": "RLXKernel_V2-cip100",
+                      "KERNEL_CREATOR": "@rlxhype",
+                      "BUILD_DATE": "2026-11-21",
+                      "TARGET_DEVICE": args.target,
+                      "TARGET_INCLUDES_KSU": not args.no_ksu,
+                  }
+
+              def zipName(self, name: str, time: str):
+                  return f"{name}_{self.args.target}_{time}.zip"
+
+              def anykernelFiles(self) -> "list[str]":
+                  return ["version"]
+
+
+          def main():
+              b = EurekaKernelBuild()
+              b.build()
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          cat > AnyKernel3/version <<'VEREOF'
+          ====================================================
+                      RLXKERNEL  V2  -  CIP100
+          ====================================================
+           Kernel   : RLXKernel_V2-cip100
+           Creator  : @rlxhype
+           Build    : 2026-11-21
+           Base     : EurekaV2 (Exynos 7885)
+           Chipset  : Exynos 7885 / Mali G71 MP2
+           Android  : OneUI & AOSP ROMs / GSIs
+           Devices  : A10 / A20 / A20E / A30 / A30S / A40
+           Version  : V2 - cip100
+           Root     : KernelSU (upstream pinned)
+          ----------------------------------------------------
+                      PERFORMANCE AND GAMING KERNEL
+          ----------------------------------------------------
+           Overclock Big to 2.29 GHz & Little to 1.79 GHz
+           Underclock Big to 208 MHz & Little to 208 MHz
+           Overclock GPU max freq to 1300MHz
+           Balance between performance and battery life
+           Upstream kernel from 4.4.177 to 4.4.302-p6
+          ----------------------------------------------------
+           Support  : Telegram @rlxhype
+          ====================================================
+          VEREOF
+          echo '--- branding + KSU ---'
+          cat localversion localversion-cip
+          grep -n 'CONFIG_KPROBES' arch/arm64/configs/exynos7885_defconfig
+          head -8 AnyKernel3/version
+
+      - name: Build ${{ matrix.target }}
+        working-directory: kernel
+        env:
+          BUILD_JOBS: 4
+        run: python3 build_kernel.py --target ${{ matrix.target }}
+
+      - name: Verify KernelSU compiled in
+        working-directory: kernel
+        run: |
+          grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU ENABLED OK' || \
+            { echo 'KSU NOT ENABLED'; exit 1; }
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: RLXKernel_V2-cip100_KSU_${{ matrix.target }}
+          path: kernel/RLXKernel_V2-cip100_${{ matrix.target }}_*.zip
+          if-no-files-found: error
