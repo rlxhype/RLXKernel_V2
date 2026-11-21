@@ -25,7 +25,9 @@ jobs:
           sudo apt-get install -y flex bison bc libssl-dev libelf-dev zlib1g-dev zstd \
             clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 || true
-          pip3 install git+https://github.com/Roynas-Android-Playground/kernelbuild_common.git
+          git clone --depth 1 https://github.com/Roynas-Android-Playground/kernelbuild_common.git "$RUNNER_TEMP/kbc"
+          echo "PYTHONPATH=$RUNNER_TEMP/kbc" >> "$GITHUB_ENV"
+          PYTHONPATH="$RUNNER_TEMP/kbc" python3 -c "import kernelbuild_common; print('IMPORT OK')"
 
       - name: Setup toolchain dir + branding
         working-directory: kernel
