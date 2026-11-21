@@ -6,6 +6,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [a10, a20, a20e, a30, a30s, a40]
     steps:
       - name: Checkout upstream EurekaV2 source
         uses: actions/checkout@v4
@@ -21,6 +25,7 @@ jobs:
           sudo apt-get install -y flex bison bc libssl-dev libelf-dev zlib1g-dev zstd \
             clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 || true
+          pip3 install git+https://github.com/Roynas-Android-Playground/kernelbuild_common.git
 
       - name: Setup toolchain dir + branding
         working-directory: kernel
@@ -136,11 +141,11 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: Build A10 (KSU)
+      - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
         env:
           BUILD_JOBS: 2
-        run: python3 build_kernel.py --target a10 --show-output
+        run: python3 build_kernel.py --target ${{ matrix.target }} --show-output
 
       - name: Verify KSU
         working-directory: kernel
@@ -149,7 +154,6 @@ jobs:
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: RLXKernel_V2-cip100_KSU_a10
-          path: kernel/RLXKernel_V2-cip100_a10_*.zip
+          name: RLXKernel_V2-cip100_KSU_${{ matrix.target }}
+          path: kernel/RLXKernel_V2-cip100_${{ matrix.target }}_*.zip
           if-no-files-found: error
-          
