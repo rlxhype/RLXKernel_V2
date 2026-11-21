@@ -41,6 +41,13 @@ jobs:
           printf '%s\n' '-RLXKernel_V2' > localversion
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
+          # Enable KSU properly: arm64 must select HAVE_KPROBES, drivers must wire Kconfig/Makefile
+          grep -q 'select HAVE_KPROBES' arch/arm64/Kconfig || \
+            sed -i '/^config ARM64$/a\tselect HAVE_KPROBES' arch/arm64/Kconfig
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            sed -i '/^endmenu$/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          grep -q 'obj-$(CONFIG_KSU)' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           grep -q '^CONFIG_KPROBES=y' arch/arm64/configs/exynos7885_defconfig || \
             printf '\nCONFIG_KPROBES=y\n' >> arch/arm64/configs/exynos7885_defconfig
           cat > build_kernel.py <<'PYEOF'
@@ -149,14 +156,9 @@ jobs:
           BUILD_JOBS: 2
         run: python3 build_kernel.py --target ${{ matrix.target }} --show-output
 
-      - name: Verify KSU (non-blocking)
+      - name: Verify KSU
         working-directory: kernel
-        run: |
-          if grep -q 'CONFIG_KSU=y' out/.config; then
-            echo 'KSU OK'
-          else
-            echo 'KSU WARNING: not enabled in this upstream defconfig; zip is still flashed normally'
-          fi
+        run: grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU OK'
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
