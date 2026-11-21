@@ -2,6 +2,8 @@ name: Build RLXKernel_V2-cip100 (KernelSU)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   build:
