@@ -191,6 +191,55 @@ jobs:
           PYFIX
           grep -nE 'SDCARD_FS|SDFAT_FS|SDFAT_USE_FOR|MMC_DW_DEBUG|INPUT_RLX_DT2W' arch/arm64/configs/exynos7885_defconfig
 
+      - name: FAT_VIRTUAL_XATTR backport (from working kernel source)
+        working-directory: kernel
+        run: |
+          python3 - <<'PYFAT'
+          from pathlib import Path
+
+          # xattr.c from the working kernel: virtual SELinux label for FAT
+          Path('fs/fat/xattr.c').write_text("#include <linux/file.h>\n#include <linux/fs.h>\n#include <linux/xattr.h>\n#include <linux/dcache.h>\n#include \"fat.h\"\n\n#ifndef CONFIG_FAT_VIRTUAL_XATTR_SELINUX_LABEL\n#define CONFIG_FAT_VIRTUAL_XATTR_SELINUX_LABEL	(\"undefined\")\n#endif\n\nstatic const char default_xattr[] = CONFIG_FAT_VIRTUAL_XATTR_SELINUX_LABEL;\n\nint fat_setxattr(struct dentry *dentry, const char *name, const void *value, size_t size, int flags) {\n	if (!name || strcmp(name, \"security.selinux\"))\n		return -EOPNOTSUPP;\n	return 0;\n}\n\nssize_t fat_getxattr(struct dentry *dentry, const char *name, void *value, size_t size) {\n	if (!name || strcmp(name, \"security.selinux\"))\n		return -EOPNOTSUPP;\n	if (size > strlen(default_xattr)+1 && value)\n		strcpy(value, default_xattr);\n	return strlen(default_xattr);\n}\n\nssize_t fat_listxattr(struct dentry *dentry, char *list, size_t size) {\n	return 0;\n}\n\nint fat_removexattr(struct dentry *dentry, const char *name) {\n	if (!name || strcmp(name, \"security.selinux\"))\n		return -EOPNOTSUPP;\n	return 0;\n}\n")
+
+          p = Path('fs/fat/Makefile')
+          t = p.read_text()
+          old = 'fat-y := cache.o dir.o fatent.o file.o inode.o misc.o nfs.o'
+          assert old in t, 'fat Makefile anchor missing'
+          p.write_text(t.replace(old, old + ' xattr.o', 1))
+
+          p = Path('fs/fat/Kconfig')
+          t = p.read_text()
+          if 'config FAT_VIRTUAL_XATTR' not in t:
+              p.write_text(t.rstrip('\n') + "\nconfig FAT_VIRTUAL_XATTR\n	bool \"Virtual xattr support for FAT filesystem\"\n	depends on FAT_FS\n	default y\n	help\n	  Modification of FAT filesystem for virtual xattr\n\nconfig FAT_VIRTUAL_XATTR_SELINUX_LABEL\n	string \"Default string for SELinux label\"\n	depends on FAT_FS && FAT_VIRTUAL_XATTR\n	default \"u:object_r:sdcard_external:s0\"\n	help\n	  Set this to the default string for SELinux label.\n")
+
+          p = Path('fs/fat/fat.h')
+          t = p.read_text()
+          if 'fat_setxattr' not in t:
+              assert '/* helper for printk */' in t
+              p.write_text(t.replace('/* helper for printk */', "/* fat/xattr.c */\nextern int fat_setxattr(struct dentry *dentry, const char *name,\n			const void *value, size_t size, int flags);\nextern ssize_t fat_getxattr(struct dentry *dentry, const char *name,\n			void *value, size_t size);\nextern ssize_t fat_listxattr(struct dentry *dentry, char *list, size_t size);\nextern int fat_removexattr(struct dentry *dentry, const char *name);\n\n" + '/* helper for printk */', 1))
+
+          ops = "#ifdef CONFIG_FAT_VIRTUAL_XATTR\n	.setxattr	= fat_setxattr,\n	.getxattr	= fat_getxattr,\n	.listxattr	= fat_listxattr,\n	.removexattr	= fat_removexattr,\n#endif\n"
+          p = Path('fs/fat/file.c')
+          t = p.read_text()
+          a = 'const struct inode_operations fat_file_inode_operations = {\n'
+          assert a in t, 'file.c anchor missing'
+          p.write_text(t.replace(a, a + ops, 1))
+
+          p = Path('fs/fat/namei_vfat.c')
+          t = p.read_text()
+          a = '\t.getattr\t= fat_getattr,\n};'
+          assert a in t, 'namei_vfat.c anchor missing'
+          p.write_text(t.replace(a, '\t.getattr\t= fat_getattr,\n' + ops + '};', 1))
+
+          p = Path('arch/arm64/configs/exynos7885_defconfig')
+          t = p.read_text().rstrip('\n')
+          t += ('\nCONFIG_FAT_FS=y\nCONFIG_VFAT_FS=y\n'
+                'CONFIG_FAT_VIRTUAL_XATTR=y\n'
+                'CONFIG_FAT_VIRTUAL_XATTR_SELINUX_LABEL="u:object_r:sdcard_external:s0"\n')
+          p.write_text(t + '\n')
+          print('FAT_VIRTUAL_XATTR backport: OK')
+          PYFAT
+          grep -nE 'FAT_VIRTUAL_XATTR|VFAT_FS|fat-y' fs/fat/Kconfig fs/fat/Makefile arch/arm64/configs/exynos7885_defconfig | tail -10
+
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
         env:
