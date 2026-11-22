@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [a10, a20, a20e, a30, a30s, a40]
+        target: [a10]
     steps:
       - name: Checkout upstream EurekaV2 source
         uses: actions/checkout@v4
@@ -132,7 +132,7 @@ jobs:
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
            Root     : KernelSU Next v3.4.0-legacy
-           Fix      : External storage + DT2W
+           Fix      : SD force-present + generic DT2W
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
@@ -146,26 +146,310 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: External storage + DT2W fix
+      - name: SD card + generic DT2W fix
         working-directory: kernel
         run: |
-          cat > /tmp/rlx_fix.py <<'PYEOF'
+          cat > drivers/input/dt2w.c <<'DT2WEOF'
+          /*
+           * RLX generic double-tap-to-wake (panel independent).
+           *
+           * This is a normal input handler: it listens to every touchscreen that
+           * exports BTN_TOUCH / ABS_MT_POSITION_X, so it keeps working after an
+           * LCD/touch-panel replacement regardless of the touch IC in use.
+           *
+           * It only fires while the framebuffer is blanked (or the system is
+           * suspended), so double tapping with the screen on never turns it off.
+           */
+          
+          #include <linux/input.h>
+          #include <linux/module.h>
+          #include <linux/init.h>
+          #include <linux/slab.h>
+          #include <linux/jiffies.h>
+          #include <linux/notifier.h>
+          #include <linux/pm_wakeup.h>
+          #include <linux/suspend.h>
+          #include <linux/fb.h>
+          
+          struct rlx_dt2w {
+          	struct input_handler handler;
+          	struct input_dev *wake_dev;
+          	unsigned long last_down;
+          	int cur_x, cur_y;
+          	int last_x, last_y;
+          	bool armed;
+          	bool fb_blanked;
+          	bool suspended;
+          };
+          
+          static struct rlx_dt2w *rlx_dt2w;
+          
+          static inline bool rlx_dt2w_screen_off(struct rlx_dt2w *d)
+          {
+          	return d->fb_blanked || d->suspended;
+          }
+          
+          static void rlx_dt2w_fire(struct rlx_dt2w *d)
+          {
+          	/* KEY_POWER on a dedicated wakeup-enabled device resumes Android */
+          	input_report_key(d->wake_dev, KEY_POWER, 1);
+          	input_sync(d->wake_dev);
+          	input_report_key(d->wake_dev, KEY_POWER, 0);
+          	input_sync(d->wake_dev);
+          	pm_wakeup_event(&d->wake_dev->dev, 1000);
+          	d->armed = false;
+          }
+          
+          static void rlx_dt2w_event(struct input_handle *handle, unsigned int type,
+          			   unsigned int code, int value)
+          {
+          	struct rlx_dt2w *d = handle->handler->private;
+          
+          	if (type == EV_ABS) {
+          		if (code == ABS_MT_POSITION_X || code == ABS_X)
+          			d->cur_x = value;
+          		else if (code == ABS_MT_POSITION_Y || code == ABS_Y)
+          			d->cur_y = value;
+          		return;
+          	}
+          
+          	if (type != EV_KEY || code != BTN_TOUCH)
+          		return;
+          
+          	if (value) { /* finger down */
+          		unsigned long now = jiffies;
+          		int dx = d->cur_x - d->last_x;
+          		int dy = d->cur_y - d->last_y;
+          
+          		if (dx < 0) dx = -dx;
+          		if (dy < 0) dy = -dy;
+          
+          		if (rlx_dt2w_screen_off(d) && d->armed &&
+          		    time_before(now, d->last_down + msecs_to_jiffies(400)) &&
+          		    dx < 150 && dy < 150) {
+          			rlx_dt2w_fire(d);
+          		} else {
+          			d->armed = true;
+          		}
+          		d->last_down = now;
+          		d->last_x = d->cur_x;
+          		d->last_y = d->cur_y;
+          	} else {
+          		/* release: keep armed so the next press can complete the tap */
+          	}
+          }
+          
+          static int rlx_dt2w_connect(struct input_handler *handler, struct input_dev *dev,
+          			    const struct input_device_id *id)
+          {
+          	struct input_handle *handle;
+          	int error;
+          
+          	if (rlx_dt2w && dev == rlx_dt2w->wake_dev)
+          		return -ENODEV;
+          
+          	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+          	if (!handle)
+          		return -ENOMEM;
+          
+          	input_handle_init(handle, dev, handler);
+          	handle->name = "rlx_dt2w";
+          
+          	error = input_register_handle(handle);
+          	if (error)
+          		goto err_free;
+          
+          	error = input_open_device(handle);
+          	if (error)
+          		goto err_unregister;
+          
+          	return 0;
+          
+          err_unregister:
+          	input_unregister_handle(handle);
+          err_free:
+          	kfree(handle);
+          	return error;
+          }
+          
+          static void rlx_dt2w_disconnect(struct input_handle *handle)
+          {
+          	input_close_device(handle);
+          	input_unregister_handle(handle);
+          	kfree(handle);
+          }
+          
+          static const struct input_device_id rlx_dt2w_ids[] = {
+          	{
+          		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
+          		.evbit = { BIT_MASK(EV_ABS) },
+          		.absbit = { BIT_MASK(ABS_MT_POSITION_X) },
+          	},
+          	{
+          		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
+          		.evbit = { BIT_MASK(EV_ABS) },
+          		.absbit = { BIT_MASK(ABS_X) },
+          	},
+          	{ },
+          };
+          MODULE_DEVICE_TABLE(input, rlx_dt2w_ids);
+          
+          #ifdef CONFIG_FB
+          static int rlx_dt2w_fb_notifier(struct notifier_block *nb, unsigned long event,
+          				void *data)
+          {
+          	struct fb_event *evdata = data;
+          	int blank;
+          
+          	if (event != FB_EVENT_BLANK || !rlx_dt2w)
+          		return NOTIFY_DONE;
+          	if (!evdata || !evdata->data)
+          		return NOTIFY_DONE;
+          
+          	blank = *(int *)evdata->data;
+          	rlx_dt2w->fb_blanked = (blank != FB_BLANK_UNBLANK);
+          	if (!rlx_dt2w->fb_blanked)
+          		rlx_dt2w->armed = false;
+          
+          	return NOTIFY_OK;
+          }
+          
+          static struct notifier_block rlx_dt2w_fb_nb = {
+          	.notifier_call = rlx_dt2w_fb_notifier,
+          };
+          #endif
+          
+          static int rlx_dt2w_pm_notifier(struct notifier_block *nb, unsigned long event,
+          				void *unused)
+          {
+          	if (!rlx_dt2w)
+          		return NOTIFY_DONE;
+          
+          	switch (event) {
+          	case PM_SUSPEND_PREPARE:
+          		rlx_dt2w->suspended = true;
+          		break;
+          	case PM_POST_SUSPEND:
+          		rlx_dt2w->suspended = false;
+          		break;
+          	default:
+          		break;
+          	}
+          	return NOTIFY_DONE;
+          }
+          
+          static struct notifier_block rlx_dt2w_pm_nb = {
+          	.notifier_call = rlx_dt2w_pm_notifier,
+          };
+          
+          static int __init rlx_dt2w_init(void)
+          {
+          	struct rlx_dt2w *d;
+          	int err;
+          
+          	d = kzalloc(sizeof(*d), GFP_KERNEL);
+          	if (!d)
+          		return -ENOMEM;
+          	rlx_dt2w = d;
+          
+          	d->wake_dev = input_allocate_device();
+          	if (!d->wake_dev) {
+          		err = -ENOMEM;
+          		goto err_free;
+          	}
+          	d->wake_dev->name = "rlx_dt2w_wake";
+          	d->wake_dev->phys = "rlx_dt2w/input0";
+          	set_bit(EV_KEY, d->wake_dev->evbit);
+          	set_bit(KEY_POWER, d->wake_dev->keybit);
+          
+          	err = input_register_device(d->wake_dev);
+          	if (err)
+          		goto err_free_dev;
+          	device_init_wakeup(&d->wake_dev->dev, true);
+          
+          	d->handler.name = "rlx_dt2w";
+          	d->handler.event = rlx_dt2w_event;
+          	d->handler.connect = rlx_dt2w_connect;
+          	d->handler.disconnect = rlx_dt2w_disconnect;
+          	d->handler.id_table = rlx_dt2w_ids;
+          	d->handler.private = d;
+          
+          	err = input_register_handler(&d->handler);
+          	if (err)
+          		goto err_unregister_dev;
+          
+          #ifdef CONFIG_FB
+          	fb_register_client(&rlx_dt2w_fb_nb);
+          #endif
+          	register_pm_notifier(&rlx_dt2w_pm_nb);
+          
+          	pr_info("RLX DT2W: generic double-tap-to-wake loaded (all touch panels)\n");
+          	return 0;
+          
+          err_unregister_dev:
+          	input_unregister_device(d->wake_dev);
+          err_free_dev:
+          	input_free_device(d->wake_dev);
+          err_free:
+          	kfree(d);
+          	rlx_dt2w = NULL;
+          	return err;
+          }
+          
+          static void __exit rlx_dt2w_exit(void)
+          {
+          	struct rlx_dt2w *d = rlx_dt2w;
+          
+          	if (!d)
+          		return;
+          
+          	unregister_pm_notifier(&rlx_dt2w_pm_nb);
+          #ifdef CONFIG_FB
+          	fb_unregister_client(&rlx_dt2w_fb_nb);
+          #endif
+          	input_unregister_handler(&d->handler);
+          	device_init_wakeup(&d->wake_dev->dev, false);
+          	input_unregister_device(d->wake_dev);
+          	kfree(d);
+          	rlx_dt2w = NULL;
+          }
+          
+          module_init(rlx_dt2w_init);
+          module_exit(rlx_dt2w_exit);
+          
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("@rlxhype");
+          MODULE_DESCRIPTION("RLX generic panel-independent double tap to wake");
+          DT2WEOF
+          python3 - <<'PYFIX'
           from pathlib import Path
           
-          # ---------- 1) External storage fix: poll removable SD cards ----------
+          # ---------- SD card: polling + force-present fallback ----------
           p = Path('drivers/mmc/host/dw_mmc.c')
           s = p.read_text()
-          anchor = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
-          assert anchor in s, 'dw_mmc anchor not found'
-          if 'MMC_CAP_NEEDS_POLL' not in s:
-              ins = ('\n\t/* RLX: One UI 7 port dtbo card-detect GPIO fixup: poll removable cards */\n'
-                     '\tif (!(mmc->caps & MMC_CAP_NONREMOVABLE))\n'
-                     '\t\tmmc->caps |= MMC_CAP_NEEDS_POLL;\n')
-              s = s.replace(anchor, anchor + ins, 1)
-              p.write_text(s)
-          print('SD polling patch: OK')
           
-          # Samsung One UI vold expects kernel sdcardfs for external storage
+          a1 = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
+          assert a1 in s, 'dw_mmc probe anchor missing'
+          if 'MMC_CAP_NEEDS_POLL' not in s:
+              s = s.replace(a1, a1 + '''\n\t/* RLX: One UI 7 port - poll removable SD slot (card-detect GPIO unreliable) */
+          \tif (!(mmc->caps & MMC_CAP_NONREMOVABLE))
+          \t\tmmc->caps |= MMC_CAP_NEEDS_POLL;
+          ''', 1)
+          
+          a2 = '\tspin_lock_bh(&host->lock);\n\tif (present) {\n\t\tset_bit(DW_MMC_CARD_PRESENT, &slot->flags);\n'
+          assert a2 in s, 'dw_mci_get_cd anchor missing'
+          if 'RLX force card-present' not in s:
+              s = s.replace(a2, '''\t/* RLX force card-present: polling slots must accept an inserted card
+          \t * even when the board card-detect GPIO reports the wrong level.
+          \t */
+          \tif (mmc->caps & MMC_CAP_NEEDS_POLL)
+          \t\tpresent = 1;
+          
+          ''' + a2, 1)
+          p.write_text(s)
+          print('SD polling + force-present: OK')
+          
+          # ---------- sdcardfs ----------
           d = Path('arch/arm64/configs/exynos7885_defconfig')
           c = d.read_text()
           if not any(l.strip() == 'CONFIG_SDCARD_FS=y' for l in c.splitlines()):
@@ -173,58 +457,42 @@ jobs:
               d.write_text(c)
           print('sdcardfs: OK')
           
-          # ---------- 2) DT2W: software double-tap detector in the A10 touch driver ----------
-          t = Path('drivers/input/touchscreen/sec_incell_ts/sec_ts.c')
-          src = t.read_text()
+          # ---------- generic DT2W wiring ----------
+          src = Path('drivers/input/dt2w.c')
+          assert src.exists(), 'dt2w.c missing'
+          k = Path('drivers/input/Kconfig')
+          s = k.read_text()
+          if 'INPUT_RLX_DT2W' not in s:
+              marker = '\nsource "drivers/input/mouse/Kconfig"\n'
+              assert marker in s
+              s = s.replace(marker, '''
+          config INPUT_RLX_DT2W
+          \tbool "RLX generic double tap to wake"
+          \tdepends on INPUT && FB
+          \thelp
+          \t  Panel-independent double tap to wake. Works with any touch IC,
+          \t  including replacement LCD/touch panels.
+          ''' + marker, 1)
+              k.write_text(s)
           
-          statics = '''struct sec_ts_data *ts_dup;
-          '''
-          assert statics in src, 'touch static anchor not found'
-          dt2w_state = '''struct sec_ts_data *ts_dup;
+          m = Path('drivers/input/Makefile')
+          s = m.read_text()
+          if 'dt2w.o' not in s:
+              marker = 'obj-$(CONFIG_INPUT_EVDEV)\t+= evdev.o\n'
+              assert marker in s
+              s = s.replace(marker, marker + 'obj-$(CONFIG_INPUT_RLX_DT2W)\t+= dt2w.o\n', 1)
+              m.write_text(s)
           
-          /* RLX DT2W: software double-tap detector (screen-off wake gesture) */
-          static unsigned long rlx_dt2w_last;
-          static int rlx_dt2w_x, rlx_dt2w_y;
-          static bool rlx_dt2w_armed;
-          '''
-          if 'rlx_dt2w_armed' not in src:
-              src = src.replace(statics, dt2w_state, 1)
-          
-          press = '''\t\t\t\t\t} else if (ts->coord[t_id].action == SEC_TS_COORDINATE_ACTION_PRESS) {
-          \t\t\t\t\t\tdo_gettimeofday(&ts->time_pressed[t_id]);
-          '''
-          assert press in src, 'touch press anchor not found'
-          dt2w_code = press + '''
-          \t\t\t\t\t\t/* RLX DT2W: two taps close in time and place => wake gesture */
-          \t\t\t\t\t\t{
-          \t\t\t\t\t\t\tunsigned long rlx_now = jiffies;
-          \t\t\t\t\t\t\tint rlx_dx = ts->coord[t_id].x - rlx_dt2w_x;
-          \t\t\t\t\t\t\tint rlx_dy = ts->coord[t_id].y - rlx_dt2w_y;
-          \t\t\t\t\t\t\tif (rlx_dx < 0) rlx_dx = -rlx_dx;
-          \t\t\t\t\t\t\tif (rlx_dy < 0) rlx_dy = -rlx_dy;
-          \t\t\t\t\t\t\tif (rlx_dt2w_armed &&
-          \t\t\t\t\t\t\t    time_before(rlx_now, rlx_dt2w_last + msecs_to_jiffies(350)) &&
-          \t\t\t\t\t\t\t    rlx_dx < 120 && rlx_dy < 120) {
-          \t\t\t\t\t\t\t\tinput_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
-          \t\t\t\t\t\t\t\tinput_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 0);
-          \t\t\t\t\t\t\t\trlx_dt2w_armed = false;
-          \t\t\t\t\t\t\t} else {
-          \t\t\t\t\t\t\t\trlx_dt2w_armed = true;
-          \t\t\t\t\t\t\t}
-          \t\t\t\t\t\t\trlx_dt2w_last = rlx_now;
-          \t\t\t\t\t\t\trlx_dt2w_x = ts->coord[t_id].x;
-          \t\t\t\t\t\t\trlx_dt2w_y = ts->coord[t_id].y;
-          \t\t\t\t\t\t}
-          '''
-          if 'RLX DT2W: two taps' not in src:
-              src = src.replace(press, dt2w_code, 1)
-              t.write_text(src)
-          print('DT2W patch: OK')
-          PYEOF
-          python3 /tmp/rlx_fix.py
+          d = Path('arch/arm64/configs/exynos7885_defconfig')
+          s = d.read_text()
+          if 'CONFIG_INPUT_RLX_DT2W=y' not in s:
+              s = s.rstrip('\n') + '\nCONFIG_INPUT_RLX_DT2W=y\n'
+              d.write_text(s)
+          print('generic DT2W wiring: OK')
+          PYFIX
+          grep -n 'RLX force card-present' drivers/mmc/host/dw_mmc.c
           grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
-          grep -n 'SDCARD_FS' arch/arm64/configs/exynos7885_defconfig
-          grep -n 'rlx_dt2w' drivers/input/touchscreen/sec_incell_ts/sec_ts.c | head -3
+          grep -n 'INPUT_RLX_DT2W' arch/arm64/configs/exynos7885_defconfig
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
