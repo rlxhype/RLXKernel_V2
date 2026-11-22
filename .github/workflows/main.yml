@@ -1,4 +1,4 @@
-name: Build RLXKernel_V2-cip100 (KernelSU)
+name: Build RLXKernel_V2-cip100 (KSU Next / One UI 7)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Shaheddan/android_kernel_samsung_exynos7885
-          ref: EurekaV2
+          ref: android-15
           submodules: recursive
           path: kernel
 
@@ -43,8 +43,8 @@ jobs:
           printf '%s\n' '-RLXKernel_V2' > localversion
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
-          grep -q '^CONFIG_KPROBES=y' arch/arm64/configs/exynos7885_defconfig || \
-            printf '\nCONFIG_KPROBES=y\n' >> arch/arm64/configs/exynos7885_defconfig
+          # android-15 branch ships vendored KernelSU-Next v3.4.0-legacy
+          # (CONFIG_KSU=y, manual hooks) and the One UI 7 sdcard fix.
           cat > build_kernel.py <<'PYEOF'
           from kernelbuild_common import KernelBuild, logging
           from kernelbuild_common.compiler import CompilerClang
@@ -126,13 +126,13 @@ jobs:
            Kernel   : RLXKernel_V2-cip100
            Creator  : @rlxhype
            Build    : 2026-11-21
-           Base     : EurekaV2 / One UI 7 (Exynos 7885)
+           Base     : android-15 / One UI 7 (Exynos 7885)
            Chipset  : Exynos 7885 / Mali G71 MP2
            Android  : OneUI & AOSP ROMs / GSIs
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
            Root     : KernelSU Next v3.4.0-legacy
-           Fix      : SD force-present + generic DT2W
+           Fix      : SD-card for One UI 7 (sdcardfs off)
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
@@ -146,31 +146,35 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: SD card fix (SDFAT owns vfat/exfat mounts)
+      - name: SD card fix (SDFAT registers vfat/exfat + sdcardfs)
         working-directory: kernel
         run: |
           python3 - <<'PYFIX'
           from pathlib import Path
           d = Path('arch/arm64/configs/exynos7885_defconfig')
           c = d.read_text()
-          # Stock/Equinox behaviour: sdFAT registers the "vfat" filesystem.
-          # CONFIG_VFAT_FS=y blocks SDFAT_USE_FOR_VFAT, so external SD never mounts.
           if 'CONFIG_VFAT_FS=y' in c:
               c = c.replace('CONFIG_VFAT_FS=y', '# CONFIG_VFAT_FS is not set')
+          if '# CONFIG_SDCARD_FS is not set' in c:
+              c = c.replace('# CONFIG_SDCARD_FS is not set', 'CONFIG_SDCARD_FS=y')
           for opt in ['CONFIG_SDFAT_FS=y', 'CONFIG_SDFAT_USE_FOR_VFAT=y',
                       'CONFIG_SDFAT_USE_FOR_EXFAT=y']:
               if not any(l.strip() == opt for l in c.splitlines()):
                   c = c.rstrip('\n') + '\n' + opt + '\n'
           d.write_text(c)
-          print('SDFAT vfat/exfat registration: OK')
+          print('SDFAT + sdcardfs: OK')
           PYFIX
-          grep -nE 'VFAT_FS|SDFAT_FS|SDFAT_USE_FOR' arch/arm64/configs/exynos7885_defconfig
+          grep -nE 'VFAT_FS|SDFAT|SDCARD_FS' arch/arm64/configs/exynos7885_defconfig
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
         env:
           BUILD_JOBS: 2
         run: python3 build_kernel.py --target ${{ matrix.target }} --show-output
+
+      - name: Verify KSU
+        working-directory: kernel
+        run: grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU OK'
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
