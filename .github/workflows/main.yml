@@ -2,6 +2,8 @@ name: Build RLXKernel_V2-cip100 (KernelSU)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   build:
@@ -10,7 +12,6 @@ jobs:
       fail-fast: false
       matrix:
         target: [a10]
-
     steps:
       - name: Checkout upstream EurekaV2 source
         uses: actions/checkout@v4
@@ -20,28 +21,28 @@ jobs:
           submodules: recursive
           path: kernel
 
-      - name: Install dependencies
+      - name: Install dependencies + clang 18
         run: |
           sudo apt-get update
-          sudo apt-get install -y flex bison bc libssl-dev libelf-dev zlib1g-dev zstd
-          pip3 install git+https://github.com/Roynas-Android-Playground/kernelbuild_common.git
+          sudo apt-get install -y flex bison bc libssl-dev libelf-dev zlib1g-dev zstd \
+            clang-18 lld-18 llvm-18 gcc-aarch64-linux-gnu
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 || true
+          git clone --depth 1 https://github.com/Roynas-Android-Playground/kernelbuild_common.git "$RUNNER_TEMP/kbc"
+          echo "PYTHONPATH=$RUNNER_TEMP/kbc" >> "$GITHUB_ENV"
+          PYTHONPATH="$RUNNER_TEMP/kbc" python3 -c "import kernelbuild_common; print('IMPORT OK')"
 
-      - name: Download Neutron Clang 18
+      - name: Setup toolchain dir + branding
         working-directory: kernel
         run: |
-          curl -L --retry 3 -o /tmp/clang.tar.zst \
-            https://github.com/Neutron-Toolchains/clang-build-catalogue/releases/download/05012024/neutron-clang-05012024.tar.zst
-          mkdir -p toolchain
-          tar --use-compress-program=unzstd -xf /tmp/clang.tar.zst -C toolchain
+          mkdir -p toolchain/bin
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-readelf llvm-objdump; do
+            [ -e /usr/bin/$t-18 ] && ln -sf /usr/bin/$t-18 toolchain/bin/$t
+          done
+          [ -e /usr/bin/clang-18 ] && ln -sf /usr/bin/clang-18 toolchain/bin/clang
           toolchain/bin/clang --version
-
-      - name: Apply RLXKernel branding + enable KernelSU
-        working-directory: kernel
-        run: |
           printf '%s\n' '-RLXKernel_V2' > localversion
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
-          # KernelSU requires KPROBES; upstream defconfig has KSU core wired already
           grep -q '^CONFIG_KPROBES=y' arch/arm64/configs/exynos7885_defconfig || \
             printf '\nCONFIG_KPROBES=y\n' >> arch/arm64/configs/exynos7885_defconfig
           cat > build_kernel.py <<'PYEOF'
@@ -90,7 +91,6 @@ jobs:
                   return defconfigs
 
               def additionalMakeArgs(self) -> "list[str]":
-                  # Parallel jobs configurable (last -j wins). Default 2 for low-RAM hosts.
                   jobs = os.environ.get("BUILD_JOBS", "2")
                   return CompilerClang.ADDITIONALARGS_LLVM_FULL + [f"-j{jobs}"]
 
@@ -126,12 +126,13 @@ jobs:
            Kernel   : RLXKernel_V2-cip100
            Creator  : @rlxhype
            Build    : 2026-11-21
-           Base     : EurekaV2 (Exynos 7885)
+           Base     : EurekaV2 / One UI 7 (Exynos 7885)
            Chipset  : Exynos 7885 / Mali G71 MP2
            Android  : OneUI & AOSP ROMs / GSIs
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
-           Root     : KernelSU (upstream pinned)
+           Root     : KernelSU Next v3.4.0-legacy
+           Fix      : SD force-present + generic DT2W
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
@@ -144,10 +145,6 @@ jobs:
            Support  : Telegram @rlxhype
           ====================================================
           VEREOF
-          echo '--- branding + KSU ---'
-          cat localversion localversion-cip
-          grep -n 'CONFIG_KPROBES' arch/arm64/configs/exynos7885_defconfig
-          head -8 AnyKernel3/version
 
       - name: SD card fix (polling + force-present + sdcardfs)
         working-directory: kernel
@@ -192,17 +189,15 @@ jobs:
           grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
           grep -n '^CONFIG_SDCARD_FS=y' arch/arm64/configs/exynos7885_defconfig
 
-      - name: Build ${{ matrix.target }}
+      - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
         env:
-          BUILD_JOBS: 4
-        run: python3 build_kernel.py --target ${{ matrix.target }}
+          BUILD_JOBS: 2
+        run: python3 build_kernel.py --target ${{ matrix.target }} --show-output
 
-      - name: Verify KernelSU compiled in
+      - name: Verify KSU
         working-directory: kernel
-        run: |
-          grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU ENABLED OK' || \
-            { echo 'KSU NOT ENABLED'; exit 1; }
+        run: grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU OK'
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
@@ -210,4 +205,3 @@ jobs:
           name: RLXKernel_V2-cip100_KSU_${{ matrix.target }}
           path: kernel/RLXKernel_V2-cip100_${{ matrix.target }}_*.zip
           if-no-files-found: error
-
