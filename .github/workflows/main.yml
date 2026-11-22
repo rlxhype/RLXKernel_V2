@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [a10, a20, a20e, a30, a30s, a40]
+        target: [a10]
 
     steps:
       - name: Checkout upstream EurekaV2 source
@@ -149,6 +149,49 @@ jobs:
           grep -n 'CONFIG_KPROBES' arch/arm64/configs/exynos7885_defconfig
           head -8 AnyKernel3/version
 
+      - name: SD card fix (polling + force-present + sdcardfs)
+        working-directory: kernel
+        run: |
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          
+          # ---------- SD card: polling + force-present fallback ----------
+          p = Path('drivers/mmc/host/dw_mmc.c')
+          s = p.read_text()
+          
+          a1 = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
+          assert a1 in s, 'dw_mmc probe anchor missing'
+          if 'MMC_CAP_NEEDS_POLL' not in s:
+              s = s.replace(a1, a1 + '''\n\t/* RLX: One UI 7 port - poll removable SD slot (card-detect GPIO unreliable) */
+          \tif (!(mmc->caps & MMC_CAP_NONREMOVABLE))
+          \t\tmmc->caps |= MMC_CAP_NEEDS_POLL;
+          ''', 1)
+          
+          a2 = '\tspin_lock_bh(&host->lock);\n\tif (present) {\n\t\tset_bit(DW_MMC_CARD_PRESENT, &slot->flags);\n'
+          assert a2 in s, 'dw_mci_get_cd anchor missing'
+          if 'RLX force card-present' not in s:
+              s = s.replace(a2, '''\t/* RLX force card-present: polling slots must accept an inserted card
+          \t * even when the board card-detect GPIO reports the wrong level.
+          \t */
+          \tif (mmc->caps & MMC_CAP_NEEDS_POLL)
+          \t\tpresent = 1;
+          
+          ''' + a2, 1)
+          p.write_text(s)
+          print('SD polling + force-present: OK')
+          
+          # ---------- sdcardfs ----------
+          d = Path('arch/arm64/configs/exynos7885_defconfig')
+          c = d.read_text()
+          if not any(l.strip() == 'CONFIG_SDCARD_FS=y' for l in c.splitlines()):
+              c = c.rstrip('\n') + '\nCONFIG_SDCARD_FS=y\n'
+              d.write_text(c)
+          print('sdcardfs: OK')
+          PYFIX
+          grep -n 'RLX force card-present' drivers/mmc/host/dw_mmc.c
+          grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
+          grep -n '^CONFIG_SDCARD_FS=y' arch/arm64/configs/exynos7885_defconfig
+
       - name: Build ${{ matrix.target }}
         working-directory: kernel
         env:
@@ -167,3 +210,4 @@ jobs:
           name: RLXKernel_V2-cip100_KSU_${{ matrix.target }}
           path: kernel/RLXKernel_V2-cip100_${{ matrix.target }}_*.zip
           if-no-files-found: error
+
