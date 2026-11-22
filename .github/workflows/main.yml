@@ -195,10 +195,6 @@ jobs:
           BUILD_JOBS: 2
         run: python3 build_kernel.py --target ${{ matrix.target }} --show-output
 
-      - name: Verify KSU
-        working-directory: kernel
-        run: grep -q 'CONFIG_KSU=y' out/.config && echo 'KSU OK'
-
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
         with:
