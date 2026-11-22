@@ -1,4 +1,4 @@
-name: Build RLXKernel_V2-cip100 (KernelSU)
+name: Build RLXKernel_V2-cip100 (KSU Next / One UI 7)
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Shaheddan/android_kernel_samsung_exynos7885
-          ref: EurekaV2
+          ref: android-15
           submodules: recursive
           path: kernel
 
@@ -43,12 +43,8 @@ jobs:
           printf '%s\n' '-RLXKernel_V2' > localversion
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
-          # Wire KernelSU into Kbuild/Kconfig (upstream ships only the symlink).
-          # This pinned KSU supports non-kprobes mode; DO NOT enable CONFIG_KPROBES.
-          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
-            sed -i '/^endmenu$/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          grep -q 'obj-$(CONFIG_KSU)' drivers/Makefile || \
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          # android-15 branch ships vendored KernelSU-Next v3.4.0-legacy
+          # (CONFIG_KSU=y, manual hooks) and the One UI 7 sdcard fix.
           cat > build_kernel.py <<'PYEOF'
           from kernelbuild_common import KernelBuild, logging
           from kernelbuild_common.compiler import CompilerClang
@@ -130,12 +126,13 @@ jobs:
            Kernel   : RLXKernel_V2-cip100
            Creator  : @rlxhype
            Build    : 2026-11-21
-           Base     : EurekaV2 (Exynos 7885)
+           Base     : android-15 / One UI 7 (Exynos 7885)
            Chipset  : Exynos 7885 / Mali G71 MP2
            Android  : OneUI & AOSP ROMs / GSIs
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
-           Root     : KernelSU (upstream pinned)
+           Root     : KernelSU Next v3.4.0-legacy
+           Fix      : SD-card for One UI 7 (sdcardfs off)
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
