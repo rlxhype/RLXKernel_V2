@@ -132,7 +132,7 @@ jobs:
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
            Root     : KernelSU Next v3.4.0-legacy
-           Fix      : SD-card (MMC polling + sdcardfs)
+           Fix      : External storage + DT2W
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
@@ -146,11 +146,13 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: SD-card fix (MMC polling + sdcardfs)
+      - name: External storage + DT2W fix
         working-directory: kernel
         run: |
-          python3 - <<'PYFIX'
+          cat > /tmp/rlx_fix.py <<'PYEOF'
           from pathlib import Path
+          
+          # ---------- 1) External storage fix: poll removable SD cards ----------
           p = Path('drivers/mmc/host/dw_mmc.c')
           s = p.read_text()
           anchor = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
@@ -161,12 +163,68 @@ jobs:
                      '\t\tmmc->caps |= MMC_CAP_NEEDS_POLL;\n')
               s = s.replace(anchor, anchor + ins, 1)
               p.write_text(s)
-          print('SD polling patch applied')
-          PYFIX
-          grep -q '^CONFIG_SDCARD_FS=y' arch/arm64/configs/exynos7885_defconfig || \
-            printf '\nCONFIG_SDCARD_FS=y\n' >> arch/arm64/configs/exynos7885_defconfig
+          print('SD polling patch: OK')
+          
+          # Samsung One UI vold expects kernel sdcardfs for external storage
+          d = Path('arch/arm64/configs/exynos7885_defconfig')
+          c = d.read_text()
+          if not any(l.strip() == 'CONFIG_SDCARD_FS=y' for l in c.splitlines()):
+              c = c.rstrip('\n') + '\nCONFIG_SDCARD_FS=y\n'
+              d.write_text(c)
+          print('sdcardfs: OK')
+          
+          # ---------- 2) DT2W: software double-tap detector in the A10 touch driver ----------
+          t = Path('drivers/input/touchscreen/sec_incell_ts/sec_ts.c')
+          src = t.read_text()
+          
+          statics = '''struct sec_ts_data *ts_dup;
+          '''
+          assert statics in src, 'touch static anchor not found'
+          dt2w_state = '''struct sec_ts_data *ts_dup;
+          
+          /* RLX DT2W: software double-tap detector (screen-off wake gesture) */
+          static unsigned long rlx_dt2w_last;
+          static int rlx_dt2w_x, rlx_dt2w_y;
+          static bool rlx_dt2w_armed;
+          '''
+          if 'rlx_dt2w_armed' not in src:
+              src = src.replace(statics, dt2w_state, 1)
+          
+          press = '''\t\t\t\t\t} else if (ts->coord[t_id].action == SEC_TS_COORDINATE_ACTION_PRESS) {
+          \t\t\t\t\t\tdo_gettimeofday(&ts->time_pressed[t_id]);
+          '''
+          assert press in src, 'touch press anchor not found'
+          dt2w_code = press + '''
+          \t\t\t\t\t\t/* RLX DT2W: two taps close in time and place => wake gesture */
+          \t\t\t\t\t\t{
+          \t\t\t\t\t\t\tunsigned long rlx_now = jiffies;
+          \t\t\t\t\t\t\tint rlx_dx = ts->coord[t_id].x - rlx_dt2w_x;
+          \t\t\t\t\t\t\tint rlx_dy = ts->coord[t_id].y - rlx_dt2w_y;
+          \t\t\t\t\t\t\tif (rlx_dx < 0) rlx_dx = -rlx_dx;
+          \t\t\t\t\t\t\tif (rlx_dy < 0) rlx_dy = -rlx_dy;
+          \t\t\t\t\t\t\tif (rlx_dt2w_armed &&
+          \t\t\t\t\t\t\t    time_before(rlx_now, rlx_dt2w_last + msecs_to_jiffies(350)) &&
+          \t\t\t\t\t\t\t    rlx_dx < 120 && rlx_dy < 120) {
+          \t\t\t\t\t\t\t\tinput_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 1);
+          \t\t\t\t\t\t\t\tinput_report_key(ts->input_dev, KEY_BLACK_UI_GESTURE, 0);
+          \t\t\t\t\t\t\t\trlx_dt2w_armed = false;
+          \t\t\t\t\t\t\t} else {
+          \t\t\t\t\t\t\t\trlx_dt2w_armed = true;
+          \t\t\t\t\t\t\t}
+          \t\t\t\t\t\t\trlx_dt2w_last = rlx_now;
+          \t\t\t\t\t\t\trlx_dt2w_x = ts->coord[t_id].x;
+          \t\t\t\t\t\t\trlx_dt2w_y = ts->coord[t_id].y;
+          \t\t\t\t\t\t}
+          '''
+          if 'RLX DT2W: two taps' not in src:
+              src = src.replace(press, dt2w_code, 1)
+              t.write_text(src)
+          print('DT2W patch: OK')
+          PYEOF
+          python3 /tmp/rlx_fix.py
           grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
           grep -n 'SDCARD_FS' arch/arm64/configs/exynos7885_defconfig
+          grep -n 'rlx_dt2w' drivers/input/touchscreen/sec_incell_ts/sec_ts.c | head -3
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
