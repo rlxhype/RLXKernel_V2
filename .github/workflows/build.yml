@@ -44,8 +44,13 @@ jobs:
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
           # Enable KSU properly: arm64 must select HAVE_KPROBES, drivers must wire Kconfig/Makefile
-          grep -q 'select HAVE_KPROBES' arch/arm64/Kconfig || \
-            sed -i '/^config ARM64$/a\tselect HAVE_KPROBES' arch/arm64/Kconfig
+          python3 - <<'PYFIX'
+          p = 'arch/arm64/Kconfig'
+          s = open(p).read()
+          if 'select HAVE_KPROBES' not in s:
+              s = s.replace('config ARM64\n', 'config ARM64\n\tselect HAVE_KPROBES\n', 1)
+              open(p, 'w').write(s)
+          PYFIX
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             sed -i '/^endmenu$/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           grep -q 'obj-$(CONFIG_KSU)' drivers/Makefile || \
