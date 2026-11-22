@@ -132,7 +132,7 @@ jobs:
            Devices  : A10 / A20 / A20E / A30 / A30S / A40
            Version  : V2 - cip100
            Root     : KernelSU Next v3.4.0-legacy
-           Fix      : SD-card for One UI 7 (sdcardfs off)
+           Fix      : SD-card (MMC polling + sdcardfs)
           ----------------------------------------------------
                       PERFORMANCE AND GAMING KERNEL
           ----------------------------------------------------
@@ -145,6 +145,28 @@ jobs:
            Support  : Telegram @rlxhype
           ====================================================
           VEREOF
+
+      - name: SD-card fix (MMC polling + sdcardfs)
+        working-directory: kernel
+        run: |
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path('drivers/mmc/host/dw_mmc.c')
+          s = p.read_text()
+          anchor = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
+          assert anchor in s, 'dw_mmc anchor not found'
+          if 'MMC_CAP_NEEDS_POLL' not in s:
+              ins = ('\n\t/* RLX: One UI 7 port dtbo card-detect GPIO fixup: poll removable cards */\n'
+                     '\tif (!(mmc->caps & MMC_CAP_NONREMOVABLE))\n'
+                     '\t\tmmc->caps |= MMC_CAP_NEEDS_POLL;\n')
+              s = s.replace(anchor, anchor + ins, 1)
+              p.write_text(s)
+          print('SD polling patch applied')
+          PYFIX
+          grep -q '^CONFIG_SDCARD_FS=y' arch/arm64/configs/exynos7885_defconfig || \
+            printf '\nCONFIG_SDCARD_FS=y\n' >> arch/arm64/configs/exynos7885_defconfig
+          grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
+          grep -n 'SDCARD_FS' arch/arm64/configs/exynos7885_defconfig
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
