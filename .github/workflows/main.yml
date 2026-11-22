@@ -1,4 +1,4 @@
-name: Build RLXKernel_V2-cip100 (KSU Next / One UI 7)
+name: Build RLXKernel_V2-cip100 (KSU Next / SD fix + DT2W)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [a10]
+        target: [a10, a20, a20e, a30, a30s, a40]
     steps:
       - name: Checkout upstream EurekaV2 source
         uses: actions/checkout@v4
@@ -146,25 +146,50 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: SD card fix (SDFAT registers vfat/exfat + sdcardfs)
+      - name: SD fix (from nxtbeta/Equinox config) + generic DT2W
         working-directory: kernel
         run: |
           python3 - <<'PYFIX'
           from pathlib import Path
+
+          # ---- SD card: exact options used by the working nxtbeta/Equinox kernels ----
           d = Path('arch/arm64/configs/exynos7885_defconfig')
           c = d.read_text()
-          if 'CONFIG_VFAT_FS=y' in c:
-              c = c.replace('CONFIG_VFAT_FS=y', '# CONFIG_VFAT_FS is not set')
-          if '# CONFIG_SDCARD_FS is not set' in c:
-              c = c.replace('# CONFIG_SDCARD_FS is not set', 'CONFIG_SDCARD_FS=y')
-          for opt in ['CONFIG_SDFAT_FS=y', 'CONFIG_SDFAT_USE_FOR_VFAT=y',
-                      'CONFIG_SDFAT_USE_FOR_EXFAT=y']:
-              if not any(l.strip() == opt for l in c.splitlines()):
-                  c = c.rstrip('\n') + '\n' + opt + '\n'
+          opts = "CONFIG_SDCARD_FS=y CONFIG_SDFAT_FS=y CONFIG_SDFAT_DELAYED_META_DIRTY=y CONFIG_SDFAT_ALIGNED_MPAGE_WRITE=y CONFIG_SDFAT_SUPPORT_STLOG=y CONFIG_SDFAT_DEBUG=y CONFIG_SDFAT_DBG_MSG=y CONFIG_SDFAT_STATISTICS=y CONFIG_SDFAT_UEVENT=y CONFIG_MMC_DW_DEBUG=y CONFIG_MMC_DW_PLTFM=y CONFIG_MMC_BLOCK_BOUNCE=y CONFIG_MMC_BLOCK_MINORS=8 CONFIG_FUSE_FS=y".split()
+          for opt in opts:
+              name = opt.split('=')[0]
+              lines = [l for l in c.splitlines()
+                       if l.strip() != opt and not l.startswith(name + '=')
+                       and not l.startswith('# ' + name + ' is not set')]
+              lines.append(opt)
+              c = '\n'.join(lines) + '\n'
           d.write_text(c)
-          print('SDFAT + sdcardfs: OK')
+          print('SD options applied:', len(opts))
+
+          # ---- DT2W: panel-independent input handler, works with any touch IC ----
+          Path('drivers/input/dt2w.c').write_text("/*\n * RLX generic double-tap-to-wake (panel independent).\n *\n * This is a normal input handler: it listens to every touchscreen that\n * exports BTN_TOUCH / ABS_MT_POSITION_X, so it keeps working after an\n * LCD/touch-panel replacement regardless of the touch IC in use.\n *\n * It only fires while the framebuffer is blanked (or the system is\n * suspended), so double tapping with the screen on never turns it off.\n */\n\n#include <linux/input.h>\n#include <linux/module.h>\n#include <linux/init.h>\n#include <linux/slab.h>\n#include <linux/jiffies.h>\n#include <linux/notifier.h>\n#include <linux/pm_wakeup.h>\n#include <linux/suspend.h>\n#include <linux/fb.h>\n\nstruct rlx_dt2w {\n	struct input_handler handler;\n	struct input_dev *wake_dev;\n	unsigned long last_down;\n	int cur_x, cur_y;\n	int last_x, last_y;\n	bool armed;\n	bool fb_blanked;\n	bool suspended;\n};\n\nstatic struct rlx_dt2w *rlx_dt2w;\n\nstatic inline bool rlx_dt2w_screen_off(struct rlx_dt2w *d)\n{\n	return d->fb_blanked || d->suspended;\n}\n\nstatic void rlx_dt2w_fire(struct rlx_dt2w *d)\n{\n	/* KEY_POWER on a dedicated wakeup-enabled device resumes Android */\n	input_report_key(d->wake_dev, KEY_POWER, 1);\n	input_sync(d->wake_dev);\n	input_report_key(d->wake_dev, KEY_POWER, 0);\n	input_sync(d->wake_dev);\n	pm_wakeup_event(&d->wake_dev->dev, 1000);\n	d->armed = false;\n}\n\nstatic void rlx_dt2w_event(struct input_handle *handle, unsigned int type,\n			   unsigned int code, int value)\n{\n	struct rlx_dt2w *d = handle->handler->private;\n\n	if (type == EV_ABS) {\n		if (code == ABS_MT_POSITION_X || code == ABS_X)\n			d->cur_x = value;\n		else if (code == ABS_MT_POSITION_Y || code == ABS_Y)\n			d->cur_y = value;\n		return;\n	}\n\n	if (type != EV_KEY || code != BTN_TOUCH)\n		return;\n\n	if (value) { /* finger down */\n		unsigned long now = jiffies;\n		int dx = d->cur_x - d->last_x;\n		int dy = d->cur_y - d->last_y;\n\n		if (dx < 0) dx = -dx;\n		if (dy < 0) dy = -dy;\n\n		if (rlx_dt2w_screen_off(d) && d->armed &&\n		    time_before(now, d->last_down + msecs_to_jiffies(400)) &&\n		    dx < 150 && dy < 150) {\n			rlx_dt2w_fire(d);\n		} else {\n			d->armed = true;\n		}\n		d->last_down = now;\n		d->last_x = d->cur_x;\n		d->last_y = d->cur_y;\n	} else {\n		/* release: keep armed so the next press can complete the tap */\n	}\n}\n\nstatic int rlx_dt2w_connect(struct input_handler *handler, struct input_dev *dev,\n			    const struct input_device_id *id)\n{\n	struct input_handle *handle;\n	int error;\n\n	if (rlx_dt2w && dev == rlx_dt2w->wake_dev)\n		return -ENODEV;\n\n	handle = kzalloc(sizeof(*handle), GFP_KERNEL);\n	if (!handle)\n		return -ENOMEM;\n\n	handle->dev = dev;\n	handle->handler = handler;\n	handle->name = \"rlx_dt2w\";\n\n	error = input_register_handle(handle);\n	if (error)\n		goto err_free;\n\n	error = input_open_device(handle);\n	if (error)\n		goto err_unregister;\n\n	return 0;\n\nerr_unregister:\n	input_unregister_handle(handle);\nerr_free:\n	kfree(handle);\n	return error;\n}\n\nstatic void rlx_dt2w_disconnect(struct input_handle *handle)\n{\n	input_close_device(handle);\n	input_unregister_handle(handle);\n	kfree(handle);\n}\n\nstatic const struct input_device_id rlx_dt2w_ids[] = {\n	{\n		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,\n		.evbit = { BIT_MASK(EV_ABS) },\n		.absbit = { BIT_MASK(ABS_MT_POSITION_X) },\n	},\n	{\n		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,\n		.evbit = { BIT_MASK(EV_ABS) },\n		.absbit = { BIT_MASK(ABS_X) },\n	},\n	{ },\n};\nMODULE_DEVICE_TABLE(input, rlx_dt2w_ids);\n\n#ifdef CONFIG_FB\nstatic int rlx_dt2w_fb_notifier(struct notifier_block *nb, unsigned long event,\n				void *data)\n{\n	struct fb_event *evdata = data;\n	int blank;\n\n	if (event != FB_EVENT_BLANK || !rlx_dt2w)\n		return NOTIFY_DONE;\n	if (!evdata || !evdata->data)\n		return NOTIFY_DONE;\n\n	blank = *(int *)evdata->data;\n	rlx_dt2w->fb_blanked = (blank != FB_BLANK_UNBLANK);\n	if (!rlx_dt2w->fb_blanked)\n		rlx_dt2w->armed = false;\n\n	return NOTIFY_OK;\n}\n\nstatic struct notifier_block rlx_dt2w_fb_nb = {\n	.notifier_call = rlx_dt2w_fb_notifier,\n};\n#endif\n\nstatic int rlx_dt2w_pm_notifier(struct notifier_block *nb, unsigned long event,\n				void *unused)\n{\n	if (!rlx_dt2w)\n		return NOTIFY_DONE;\n\n	switch (event) {\n	case PM_SUSPEND_PREPARE:\n		rlx_dt2w->suspended = true;\n		break;\n	case PM_POST_SUSPEND:\n		rlx_dt2w->suspended = false;\n		break;\n	default:\n		break;\n	}\n	return NOTIFY_DONE;\n}\n\nstatic struct notifier_block rlx_dt2w_pm_nb = {\n	.notifier_call = rlx_dt2w_pm_notifier,\n};\n\nstatic int __init rlx_dt2w_init(void)\n{\n	struct rlx_dt2w *d;\n	int err;\n\n	d = kzalloc(sizeof(*d), GFP_KERNEL);\n	if (!d)\n		return -ENOMEM;\n	rlx_dt2w = d;\n\n	d->wake_dev = input_allocate_device();\n	if (!d->wake_dev) {\n		err = -ENOMEM;\n		goto err_free;\n	}\n	d->wake_dev->name = \"rlx_dt2w_wake\";\n	d->wake_dev->phys = \"rlx_dt2w/input0\";\n	set_bit(EV_KEY, d->wake_dev->evbit);\n	set_bit(KEY_POWER, d->wake_dev->keybit);\n\n	err = input_register_device(d->wake_dev);\n	if (err)\n		goto err_free_dev;\n	device_init_wakeup(&d->wake_dev->dev, true);\n\n	d->handler.name = \"rlx_dt2w\";\n	d->handler.event = rlx_dt2w_event;\n	d->handler.connect = rlx_dt2w_connect;\n	d->handler.disconnect = rlx_dt2w_disconnect;\n	d->handler.id_table = rlx_dt2w_ids;\n	d->handler.private = d;\n\n	err = input_register_handler(&d->handler);\n	if (err)\n		goto err_unregister_dev;\n\n#ifdef CONFIG_FB\n	fb_register_client(&rlx_dt2w_fb_nb);\n#endif\n	register_pm_notifier(&rlx_dt2w_pm_nb);\n\n	pr_info(\"RLX DT2W: generic double-tap-to-wake loaded (all touch panels)\\n\");\n	return 0;\n\nerr_unregister_dev:\n	input_unregister_device(d->wake_dev);\nerr_free_dev:\n	input_free_device(d->wake_dev);\nerr_free:\n	kfree(d);\n	rlx_dt2w = NULL;\n	return err;\n}\n\nstatic void __exit rlx_dt2w_exit(void)\n{\n	struct rlx_dt2w *d = rlx_dt2w;\n\n	if (!d)\n		return;\n\n	unregister_pm_notifier(&rlx_dt2w_pm_nb);\n#ifdef CONFIG_FB\n	fb_unregister_client(&rlx_dt2w_fb_nb);\n#endif\n	input_unregister_handler(&d->handler);\n	device_init_wakeup(&d->wake_dev->dev, false);\n	input_unregister_device(d->wake_dev);\n	kfree(d);\n	rlx_dt2w = NULL;\n}\n\nmodule_init(rlx_dt2w_init);\nmodule_exit(rlx_dt2w_exit);\n\nMODULE_LICENSE(\"GPL\");\nMODULE_AUTHOR(\"@rlxhype\");\nMODULE_DESCRIPTION(\"RLX generic panel-independent double tap to wake\");\n")
+
+          k = Path('drivers/input/Kconfig')
+          s = k.read_text()
+          if 'INPUT_RLX_DT2W' not in s:
+              marker = '\nsource "drivers/input/mouse/Kconfig"\n'
+              assert marker in s, 'Kconfig anchor missing'
+              s = s.replace(marker, "\nconfig INPUT_RLX_DT2W\n	bool \"RLX generic double tap to wake\"\n	depends on INPUT && FB\n	help\n	  Panel-independent double tap to wake. Works with any touch IC,\n	  including replacement LCD/touch panels.\n" + marker, 1)
+              k.write_text(s)
+
+          m = Path('drivers/input/Makefile')
+          s = m.read_text()
+          if 'dt2w.o' not in s:
+              marker = 'obj-$(CONFIG_INPUT_EVDEV)\t+= evdev.o\n'
+              assert marker in s, 'Makefile anchor missing'
+              s = s.replace(marker, marker + 'obj-$(CONFIG_INPUT_RLX_DT2W)\t+= dt2w.o\n', 1)
+              m.write_text(s)
+
+          if 'CONFIG_INPUT_RLX_DT2W=y' not in c:
+              d.write_text(c.rstrip('\n') + '\nCONFIG_INPUT_RLX_DT2W=y\n')
+          print('DT2W: OK')
           PYFIX
-          grep -nE 'VFAT_FS|SDFAT|SDCARD_FS' arch/arm64/configs/exynos7885_defconfig
+          grep -nE 'SDCARD_FS|SDFAT_FS|SDFAT_USE_FOR|MMC_DW_DEBUG|INPUT_RLX_DT2W' arch/arm64/configs/exynos7885_defconfig
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
