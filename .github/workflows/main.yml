@@ -146,48 +146,25 @@ jobs:
           ====================================================
           VEREOF
 
-      - name: SD card fix (polling + force-present + sdcardfs)
+      - name: SD card fix (SDFAT owns vfat/exfat mounts)
         working-directory: kernel
         run: |
           python3 - <<'PYFIX'
           from pathlib import Path
-          
-          # ---------- SD card: polling + force-present fallback ----------
-          p = Path('drivers/mmc/host/dw_mmc.c')
-          s = p.read_text()
-          
-          a1 = '\tif (host->pdata->caps2)\n\t\tmmc->caps2 = host->pdata->caps2;\n'
-          assert a1 in s, 'dw_mmc probe anchor missing'
-          if 'MMC_CAP_NEEDS_POLL' not in s:
-              s = s.replace(a1, a1 + '''\n\t/* RLX: One UI 7 port - poll removable SD slot (card-detect GPIO unreliable) */
-          \tif (!(mmc->caps & MMC_CAP_NONREMOVABLE))
-          \t\tmmc->caps |= MMC_CAP_NEEDS_POLL;
-          ''', 1)
-          
-          a2 = '\tspin_lock_bh(&host->lock);\n\tif (present) {\n\t\tset_bit(DW_MMC_CARD_PRESENT, &slot->flags);\n'
-          assert a2 in s, 'dw_mci_get_cd anchor missing'
-          if 'RLX force card-present' not in s:
-              s = s.replace(a2, '''\t/* RLX force card-present: polling slots must accept an inserted card
-          \t * even when the board card-detect GPIO reports the wrong level.
-          \t */
-          \tif (mmc->caps & MMC_CAP_NEEDS_POLL)
-          \t\tpresent = 1;
-          
-          ''' + a2, 1)
-          p.write_text(s)
-          print('SD polling + force-present: OK')
-          
-          # ---------- sdcardfs ----------
           d = Path('arch/arm64/configs/exynos7885_defconfig')
           c = d.read_text()
-          if not any(l.strip() == 'CONFIG_SDCARD_FS=y' for l in c.splitlines()):
-              c = c.rstrip('\n') + '\nCONFIG_SDCARD_FS=y\n'
-              d.write_text(c)
-          print('sdcardfs: OK')
+          # Stock/Equinox behaviour: sdFAT registers the "vfat" filesystem.
+          # CONFIG_VFAT_FS=y blocks SDFAT_USE_FOR_VFAT, so external SD never mounts.
+          if 'CONFIG_VFAT_FS=y' in c:
+              c = c.replace('CONFIG_VFAT_FS=y', '# CONFIG_VFAT_FS is not set')
+          for opt in ['CONFIG_SDFAT_FS=y', 'CONFIG_SDFAT_USE_FOR_VFAT=y',
+                      'CONFIG_SDFAT_USE_FOR_EXFAT=y']:
+              if not any(l.strip() == opt for l in c.splitlines()):
+                  c = c.rstrip('\n') + '\n' + opt + '\n'
+          d.write_text(c)
+          print('SDFAT vfat/exfat registration: OK')
           PYFIX
-          grep -n 'RLX force card-present' drivers/mmc/host/dw_mmc.c
-          grep -n 'NEEDS_POLL' drivers/mmc/host/dw_mmc.c
-          grep -n '^CONFIG_SDCARD_FS=y' arch/arm64/configs/exynos7885_defconfig
+          grep -nE 'VFAT_FS|SDFAT_FS|SDFAT_USE_FOR' arch/arm64/configs/exynos7885_defconfig
 
       - name: Build ${{ matrix.target }} (KSU)
         working-directory: kernel
