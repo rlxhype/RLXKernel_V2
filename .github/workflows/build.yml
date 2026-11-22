@@ -43,47 +43,12 @@ jobs:
           printf '%s\n' '-RLXKernel_V2' > localversion
           printf '%s\n' '-cip100' > localversion-cip
           sed -i 's/^NAME[[:space:]]*=.*/NAME = RLXKernel V2 cip100/' Makefile
-          # Wire KernelSU into Kbuild/Kconfig (upstream ships symlink only)
+          # Wire KernelSU into Kbuild/Kconfig (upstream ships only the symlink).
+          # This pinned KSU supports non-kprobes mode; DO NOT enable CONFIG_KPROBES.
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             sed -i '/^endmenu$/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           grep -q 'obj-$(CONFIG_KSU)' drivers/Makefile || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
-          # This 4.4 kernel has no arm64 kprobes. Guard KSU kprobes-only code and drop the dep.
-          python3 - <<'PYKSU'
-          from pathlib import Path
-
-          def guard(text, start, end):
-              i = text.find(start)
-              j = text.find(end, i) + len(end)
-              assert i >= 0 and j > len(start), (start, i, j)
-              return text[:i] + '#ifdef CONFIG_KPROBES\n' + text[i:j] + '\n#endif\n' + text[j:]
-
-          p = Path('KernelSU/kernel/Kconfig')
-          s = p.read_text().replace('depends on KPROBES && EXT4_FS', 'depends on EXT4_FS')
-          p.write_text(s)
-
-          p = Path('KernelSU/kernel/supercall/supercall.c')
-          s = p.read_text()
-          s = s.replace('#include <linux/kprobes.h>', '#ifdef CONFIG_KPROBES\n#include <linux/kprobes.h>\n#endif')
-          s = guard(s, 'static int reboot_handler_pre(', 'static struct kprobe reboot_kp = {\n    .symbol_name = REBOOT_SYMBOL,\n    .pre_handler = reboot_handler_pre,\n};')
-          s = s.replace('    rc = register_kprobe(&reboot_kp);\n    if (rc) {\n        pr_err("reboot kprobe failed: %d\\n", rc);\n    } else {\n        pr_info("reboot kprobe registered successfully\\n");\n    }',
-                        '#ifdef CONFIG_KPROBES\n    rc = register_kprobe(&reboot_kp);\n    if (rc) {\n        pr_err("reboot kprobe failed: %d\\n", rc);\n    } else {\n        pr_info("reboot kprobe registered successfully\\n");\n    }\n#endif')
-          s = s.replace('    unregister_kprobe(&reboot_kp);', '#ifdef CONFIG_KPROBES\n    unregister_kprobe(&reboot_kp);\n#endif')
-          p.write_text(s)
-
-          p = Path('KernelSU/kernel/runtime/ksud_integration.c')
-          s = p.read_text()
-          s = s.replace('#include <linux/kprobes.h>', '#ifdef CONFIG_KPROBES\n#include <linux/kprobes.h>\n#endif')
-          s = guard(s, 'static int input_handle_event_handler_pre(', 'static struct kprobe input_event_kp = {\n    .symbol_name = "input_event",\n    .pre_handler = input_handle_event_handler_pre,\n};')
-          s = s.replace('    unregister_kprobe(&input_event_kp);', '#ifdef CONFIG_KPROBES\n    unregister_kprobe(&input_event_kp);\n#endif')
-          s = s.replace('    ret = register_kprobe(&input_event_kp);\n    pr_info("ksud: input_event_kp: %d\\n", ret);',
-                        '#ifdef CONFIG_KPROBES\n    ret = register_kprobe(&input_event_kp);\n    pr_info("ksud: input_event_kp: %d\\n", ret);\n#else\n    ret = 0;\n#endif')
-          p.write_text(s)
-
-          p = Path('KernelSU/kernel/hook/syscall_hook_manager.c')
-          p.write_text(p.read_text().replace('#include <linux/kprobes.h>\n', ''))
-          print('KSU nokprobes patch applied')
-          PYKSU
           cat > build_kernel.py <<'PYEOF'
           from kernelbuild_common import KernelBuild, logging
           from kernelbuild_common.compiler import CompilerClang
